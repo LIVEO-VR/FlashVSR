@@ -1,3 +1,7 @@
+examples/WanVSR/FlashVSR*
+
+results
+
 # Byte-compiled / cache files
 __pycache__/
 *.py[cod]

@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, time
-import numpy as np
-from PIL import Image
+import os
+import re
+import time
+
 import imageio
-from tqdm import tqdm
+import numpy as np
 import torch
 from einops import rearrange
-
-from diffsynth import ModelManager, FlashVSRTinyPipeline
-from utils.utils import Buffer_LQ4x_Proj
+from PIL import Image
+from tqdm import tqdm
 from utils.TCDecoder import build_tcdecoder
+from utils.utils import Buffer_LQ4x_Proj
+
+from diffsynth import FlashVSRTinyPipeline, ModelManager
+
 
 def tensor2video(frames):
     frames = rearrange(frames, "C T H W -> T H W C")
@@ -19,25 +23,38 @@ def tensor2video(frames):
     frames = [Image.fromarray(frame) for frame in frames]
     return frames
 
+
 def natural_key(name: str):
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'([0-9]+)', os.path.basename(name))]
+    return [
+        int(t) if t.isdigit() else t.lower()
+        for t in re.split(r"([0-9]+)", os.path.basename(name))
+    ]
+
 
 def list_images_natural(folder: str):
-    exts = ('.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG')
+    exts = (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG")
     fs = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(exts)]
     fs.sort(key=natural_key)
     return fs
 
+
 def largest_8n1_leq(n):  # 8n+1
-    return 0 if n < 1 else ((n - 1)//8)*8 + 1
+    return 0 if n < 1 else ((n - 1) // 8) * 8 + 1
+
 
 def is_video(path):
-    return os.path.isfile(path) and path.lower().endswith(('.mp4','.mov','.avi','.mkv'))
+    return os.path.isfile(path) and path.lower().endswith(
+        (".mp4", ".mov", ".avi", ".mkv")
+    )
 
-def pil_to_tensor_neg1_1(img: Image.Image, dtype=torch.bfloat16, device='cuda'):
-    t = torch.from_numpy(np.asarray(img, np.uint8)).to(device=device, dtype=torch.float32)  # HWC
-    t = t.permute(2,0,1) / 255.0 * 2.0 - 1.0                                              # CHW in [-1,1]
+
+def pil_to_tensor_neg1_1(img: Image.Image, dtype=torch.bfloat16, device="cuda"):
+    t = torch.from_numpy(np.asarray(img, np.uint8)).to(
+        device=device, dtype=torch.float32
+    )  # HWC
+    t = t.permute(2, 0, 1) / 255.0 * 2.0 - 1.0  # CHW in [-1,1]
     return t.to(dtype)
+
 
 def save_video(frames, save_path, fps=30, quality=5):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -46,7 +63,10 @@ def save_video(frames, save_path, fps=30, quality=5):
         w.append_data(np.array(f))
     w.close()
 
-def compute_scaled_and_target_dims(w0: int, h0: int, scale: float = 4.0, multiple: int = 128):
+
+def compute_scaled_and_target_dims(
+    w0: int, h0: int, scale: float = 4.0, multiple: int = 128
+):
     if w0 <= 0 or h0 <= 0:
         raise ValueError("Invalid original size")
     if scale <= 0:
@@ -67,15 +87,16 @@ def compute_scaled_and_target_dims(w0: int, h0: int, scale: float = 4.0, multipl
     return sW, sH, tW, tH
 
 
-def upscale_then_center_crop(img: Image.Image, scale: float, tW: int, tH: int) -> Image.Image:
+def upscale_then_center_crop(
+    img: Image.Image, scale: float, tW: int, tH: int
+) -> Image.Image:
     w0, h0 = img.size
     sW = int(round(w0 * scale))
     sH = int(round(h0 * scale))
 
     if tW > sW or tH > sH:
         raise ValueError(
-            f"Target crop ({tW}x{tH}) exceeds scaled size ({sW}x{sH}). "
-            f"Increase scale."
+            f"Target crop ({tW}x{tH}) exceeds scaled size ({sW}x{sH}). Increase scale."
         )
 
     up = img.resize((sW, sH), Image.BICUBIC)
@@ -84,7 +105,9 @@ def upscale_then_center_crop(img: Image.Image, scale: float, tW: int, tH: int) -
     return up.crop((l, t, l + tW, t + tH))
 
 
-def prepare_input_tensor(path: str, scale: float = 4, dtype=torch.bfloat16, device='cuda'):
+def prepare_input_tensor(
+    path: str, scale: float = 4, dtype=torch.bfloat16, device="cuda"
+):
     if os.path.isdir(path):
         paths0 = list_images_natural(path)
         if not paths0:
@@ -93,48 +116,63 @@ def prepare_input_tensor(path: str, scale: float = 4, dtype=torch.bfloat16, devi
         with Image.open(paths0[0]) as _img0:
             w0, h0 = _img0.size
         N0 = len(paths0)
-        print(f"[{os.path.basename(path)}] Original Resolution: {w0}x{h0} | Original Frames: {N0}")
+        print(
+            f"[{os.path.basename(path)}] Original Resolution: {w0}x{h0} | Original Frames: {N0}"
+        )
 
-        sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=128)
-        print(f"[{os.path.basename(path)}] Scaled (x{scale:.2f}): {sW}x{sH} -> Target (128-multiple): {tW}x{tH}")
+        sW, sH, tW, tH = compute_scaled_and_target_dims(
+            w0, h0, scale=scale, multiple=128
+        )
+        print(
+            f"[{os.path.basename(path)}] Scaled (x{scale:.2f}): {sW}x{sH} -> Target (128-multiple): {tW}x{tH}"
+        )
 
         paths = paths0 + [paths0[-1]] * 4
         F = largest_8n1_leq(len(paths))
         if F == 0:
-            raise RuntimeError(f"Not enough frames after padding in {path}. Got {len(paths)}.")
+            raise RuntimeError(
+                f"Not enough frames after padding in {path}. Got {len(paths)}."
+            )
         paths = paths[:F]
-        print(f"[{os.path.basename(path)}] Target Frames (8n-3): {F-4}")
+        print(f"[{os.path.basename(path)}] Target Frames (8n-3): {F - 4}")
 
         frames = []
         for p in paths:
-            with Image.open(p).convert('RGB') as img:
+            with Image.open(p).convert("RGB") as img:
                 img_out = upscale_then_center_crop(img, scale=scale, tW=tW, tH=tH)
             frames.append(pil_to_tensor_neg1_1(img_out, dtype, device))
-        vid = torch.stack(frames, 0).permute(1,0,2,3).unsqueeze(0)  # 1 C F H W
+        vid = torch.stack(frames, 0).permute(1, 0, 2, 3).unsqueeze(0)  # 1 C F H W
         fps = 30
         return vid, tH, tW, F, fps
 
     if is_video(path):
         rdr = imageio.get_reader(path)
-        first = Image.fromarray(rdr.get_data(0)).convert('RGB')
+        first = Image.fromarray(rdr.get_data(0)).convert("RGB")
         w0, h0 = first.size
 
         meta = {}
-        try: meta = rdr.get_meta_data()
-        except Exception: pass
-        fps_val = meta.get('fps', 30)
+        try:
+            meta = rdr.get_meta_data()
+        except Exception:
+            pass
+        fps_val = meta.get("fps", 30)
         fps = int(round(fps_val)) if isinstance(fps_val, (int, float)) else 30
 
         def count_frames(r):
             try:
-                nf = meta.get('nframes', None)
-                if isinstance(nf,int) and nf>0: return nf
-            except Exception: pass
-            try: return r.count_frames()
+                nf = meta.get("nframes", None)
+                if isinstance(nf, int) and nf > 0:
+                    return nf
             except Exception:
-                n=0
+                pass
+            try:
+                return r.count_frames()
+            except Exception:
+                n = 0
                 try:
-                    while True: r.get_data(n); n+=1
+                    while True:
+                        r.get_data(n)
+                        n += 1
                 except Exception:
                     return n
 
@@ -143,55 +181,82 @@ def prepare_input_tensor(path: str, scale: float = 4, dtype=torch.bfloat16, devi
             rdr.close()
             raise RuntimeError(f"Cannot read frames from {path}")
 
-        print(f"[{os.path.basename(path)}] Original Resolution: {w0}x{h0} | Original Frames: {total} | FPS: {fps}")
+        print(
+            f"[{os.path.basename(path)}] Original Resolution: {w0}x{h0} | Original Frames: {total} | FPS: {fps}"
+        )
 
-        sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=128)
-        print(f"[{os.path.basename(path)}] Scaled (x{scale:.2f}): {sW}x{sH} -> Target (128-multiple): {tW}x{tH}")
+        sW, sH, tW, tH = compute_scaled_and_target_dims(
+            w0, h0, scale=scale, multiple=128
+        )
+        print(
+            f"[{os.path.basename(path)}] Scaled (x{scale:.2f}): {sW}x{sH} -> Target (128-multiple): {tW}x{tH}"
+        )
 
-        idx = list(range(total)) + [total-1]*4
+        idx = list(range(total)) + [total - 1] * 4
         F = largest_8n1_leq(len(idx))
         if F == 0:
             rdr.close()
-            raise RuntimeError(f"Not enough frames after padding in {path}. Got {len(idx)}.")
+            raise RuntimeError(
+                f"Not enough frames after padding in {path}. Got {len(idx)}."
+            )
         idx = idx[:F]
-        print(f"[{os.path.basename(path)}] Target Frames (8n-3): {F-4}")
+        print(f"[{os.path.basename(path)}] Target Frames (8n-3): {F - 4}")
 
         frames = []
         try:
             for i in idx:
-                img = Image.fromarray(rdr.get_data(i)).convert('RGB')
+                img = Image.fromarray(rdr.get_data(i)).convert("RGB")
                 img_out = upscale_then_center_crop(img, scale=scale, tW=tW, tH=tH)
                 frames.append(pil_to_tensor_neg1_1(img_out, dtype, device))
         finally:
-            try: rdr.close()
-            except Exception: pass
+            try:
+                rdr.close()
+            except Exception:
+                pass
 
-        vid = torch.stack(frames, 0).permute(1,0,2,3).unsqueeze(0)  # 1 C F H W
+        vid = torch.stack(frames, 0).permute(1, 0, 2, 3).unsqueeze(0)  # 1 C F H W
         return vid, tH, tW, F, fps
 
     raise ValueError(f"Unsupported input: {path}")
 
+
 def init_pipeline():
-    print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device()))
+    print(
+        torch.cuda.current_device(),
+        torch.cuda.get_device_name(torch.cuda.current_device()),
+    )
     mm = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
-    mm.load_models([
-        "./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors",
-    ])
+    mm.load_models(
+        [
+            "./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors",
+        ]
+    )
     pipe = FlashVSRTinyPipeline.from_model_manager(mm, device="cuda")
-    pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to("cuda", dtype=torch.bfloat16)
+    pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(
+        in_dim=3, out_dim=1536, layer_num=1
+    ).to("cuda", dtype=torch.bfloat16)
     LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt"
     if os.path.exists(LQ_proj_in_path):
-        pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(LQ_proj_in_path, map_location="cpu"), strict=True)
-    pipe.denoising_model().LQ_proj_in.to('cuda')
+        pipe.denoising_model().LQ_proj_in.load_state_dict(
+            torch.load(LQ_proj_in_path, map_location="cpu"), strict=True
+        )
+    pipe.denoising_model().LQ_proj_in.to("cuda")
 
     multi_scale_channels = [512, 256, 128, 128]
-    pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, new_latent_channels=16+768)
-    mis = pipe.TCDecoder.load_state_dict(torch.load("./FlashVSR/TCDecoder.ckpt"), strict=False)
+    pipe.TCDecoder = build_tcdecoder(
+        new_channels=multi_scale_channels, new_latent_channels=16 + 768
+    )
+    mis = pipe.TCDecoder.load_state_dict(
+        torch.load("./FlashVSR/TCDecoder.ckpt"), strict=False
+    )
     print(mis)
 
-    pipe.to('cuda'); pipe.enable_vram_management(num_persistent_param_in_dit=None)
-    pipe.init_cross_kv(); pipe.load_models_to_device(["dit","vae"])
+    pipe.to("cuda")
+    pipe.enable_vram_management(num_persistent_param_in_dit=None)
+    pipe.init_cross_kv()
+    pipe.load_models_to_device(["dit", "vae"])
     return pipe
+
 
 def main():
     RESULT_ROOT = "./results"
@@ -202,32 +267,53 @@ def main():
         "./inputs/example2.mp4",
         "./inputs/example3.mp4",
     ]
-    seed, scale, dtype, device = 0, 4.0, torch.bfloat16, 'cuda'
-    sparse_ratio = 2.0      # Recommended: 1.5 or 2.0. 1.5 → faster; 2.0 → more stable.
+    seed, scale, dtype, device = 0, 4.0, torch.bfloat16, "cuda"
+    sparse_ratio = 2.0  # Recommended: 1.5 or 2.0. 1.5 → faster; 2.0 → more stable.
     pipe = init_pipeline()
 
     for p in inputs:
-        torch.cuda.empty_cache(); torch.cuda.ipc_collect()
-        name = os.path.basename(p.rstrip('/'))
-        if name.startswith('.'):
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        name = os.path.basename(p.rstrip("/"))
+        if name.startswith("."):
             continue
         try:
-            LQ, th, tw, F, fps = prepare_input_tensor(p, scale=scale, dtype=dtype, device=device)
+            LQ, th, tw, F, fps = prepare_input_tensor(
+                p, scale=scale, dtype=dtype, device=device
+            )
         except Exception as e:
-            print(f"[Error] {name}: {e}"); continue
+            print(f"[Error] {name}: {e}")
+            continue
 
         video = pipe(
-            prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed,
-            LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
-            topk_ratio=sparse_ratio*768*1280/(th*tw), 
+            prompt="",
+            negative_prompt="",
+            cfg_scale=1.0,
+            num_inference_steps=1,
+            seed=seed,
+            LQ_video=LQ,
+            num_frames=F,
+            height=th,
+            width=tw,
+            is_full_block=False,
+            if_buffer=True,
+            topk_ratio=sparse_ratio * 768 * 1280 / (th * tw),
             kv_ratio=3.0,
             local_range=11,  # Recommended: 9 or 11. local_range=9 → sharper details; 11 → more stable results.
-            color_fix = True,
+            color_fix=True,
         )
         video = tensor2video(video)
-        save_video(video, os.path.join(RESULT_ROOT, f"FlashVSR_Tiny_{name.split('.')[0]}_seed{seed}.mp4"), fps=fps, quality=6)
+        save_video(
+            video,
+            os.path.join(
+                RESULT_ROOT, f"FlashVSR_Tiny_{name.split('.')[0]}_seed{seed}.mp4"
+            ),
+            fps=fps,
+            quality=6,
+        )
 
     print("Done.")
+
 
 if __name__ == "__main__":
     main()
