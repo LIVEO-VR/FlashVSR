@@ -10,14 +10,13 @@ import imageio
 import numpy as np
 import torch
 from einops import rearrange
-from numpy.typing import NDArray
 from PIL import Image
-from tqdm import tqdm
 
 from diffsynth import FlashVSRTinyLongPipeline, FlashVSRTinyPipeline, ModelManager
 
 from ..utils.TCDecoder import build_tcdecoder
 from ..utils.utils import Causal_LQ4x_Proj
+from ..utils.video_saver import save_video
 
 MODEL_FOLDER = os.path.join("examples", "WanVSR", "FlashVSR-v1.1")
 
@@ -280,24 +279,14 @@ def init_pipeline(long_vid_pipeline: bool = False):
 def inference_pipeline(
     frames: List[Image.Image],
     long_vid_pipeline: bool = False,
-    temp_chunk_size: int = 133,
-    temp_overlap: int = 8,
     scale: float = 4.0,
     seed: int = 0,
     sparse_ratio: float = 2.0,
     local_range: int = 11,
+    pipe=None,
 ) -> List[Image.Image]:
-    pipe = init_pipeline(long_vid_pipeline=long_vid_pipeline)
-
-    output_frames: List[Image.Image] = []
-
-    opt_temp_chunk_size = next_8n5(temp_chunk_size)
-    if opt_temp_chunk_size != temp_chunk_size:
-        print(
-            f"To maximize compute and not drop any frames, {temp_chunk_size=} was changed "
-            f"to {opt_temp_chunk_size=} (treating frames per 8n+5 chunks)."
-        )
-        temp_chunk_size = opt_temp_chunk_size
+    if pipe is None:
+        pipe = init_pipeline(long_vid_pipeline=long_vid_pipeline)
 
     total_frames = len(frames)
 
@@ -311,81 +300,52 @@ def inference_pipeline(
     frames_cpu = prepare_input_cpu(frames=frames, sW=sW, sH=sH, tW=tW, tH=tH)
     del frames
 
-    F = largest_8n1_leq(temp_chunk_size + 4)
-
-    # Get the input ready for chunking
-    nb_chunks = int(
-        np.ceil((total_frames - temp_chunk_size) / (temp_chunk_size - temp_overlap)) + 1
-    )
-
     # We will it so that chunks have the same nb of frames by padding the last one
-    n_pad_frames = (
-        (nb_chunks - 1) * (temp_chunk_size - temp_overlap)
-        + temp_chunk_size
-        - total_frames
-    )
-    print(f"Last chunk will be padded with {n_pad_frames} frames.")
+    n_pad_frames = next_8n5(total_frames) - total_frames
+    if n_pad_frames != 0:
+        print(f"In order not to drop any frames, padding with {n_pad_frames}.")
 
     padding_frames = frames_cpu[:, :, -1:, :, :].repeat(1, 1, n_pad_frames, 1, 1)
     frames_cpu = torch.cat([frames_cpu, padding_frames], dim=2)
 
-    for chunk_idx in range(nb_chunks):
-        start = chunk_idx * (temp_chunk_size - temp_overlap)
-        end = start + temp_chunk_size
+    F = largest_8n1_leq(total_frames + n_pad_frames + 4)
 
-        # Run model on chunk
-        print(f"Processing chunk {chunk_idx} (frames: {start}-{end} / {total_frames})")
+    # Add 4 padding frames
+    LQ = torch.cat([frames_cpu, frames_cpu.repeat(1, 1, 4, 1, 1)], dim=2).to(
+        device="cuda"
+    )
 
-        LQ = frames_cpu[:, :, start:end, :, :].to(device="cuda")
+    video = pipe(
+        prompt="",
+        negative_prompt="",
+        cfg_scale=1.0,
+        num_inference_steps=1,
+        seed=seed,
+        LQ_video=LQ,
+        num_frames=F,
+        height=tH,
+        width=tW,
+        is_full_block=False,
+        if_buffer=True,
+        topk_ratio=sparse_ratio * 768 * 1280 / (tH * tW),
+        kv_ratio=3.0,
+        local_range=local_range,
+        color_fix=True,
+    )
 
-        # Add 4 padding frames
-        LQ = torch.cat([LQ, LQ.repeat(1, 1, 4, 1, 1)], dim=2).to(device="cuda")
+    # Convert tensor to frames
+    frames_out = tensor2video(video)
+    print(f"{len(frames_out)=}")
 
-        video = pipe(
-            prompt="",
-            negative_prompt="",
-            cfg_scale=1.0,
-            num_inference_steps=1,
-            seed=seed,
-            LQ_video=LQ,
-            num_frames=F,
-            height=tH,
-            width=tW,
-            is_full_block=False,
-            if_buffer=True,
-            topk_ratio=sparse_ratio * 768 * 1280 / (tH * tW),
-            kv_ratio=3.0,
-            local_range=local_range,
-            color_fix=True,
-        )
+    # Remove potential padded frames
+    if n_pad_frames > 0:
+        frames_out = frames_out[:-n_pad_frames]
+        print(f"after removal, {len(frames_out)=}")
 
-        # Convert tensor to frames
-        frames_out = tensor2video(video)
-        print(f"{len(frames_out)=}")
+    del video, LQ
+    torch.cuda.empty_cache()
 
-        # Remove potential padded frames
-        if chunk_idx == nb_chunks - 1 and n_pad_frames > 0:
-            frames_out = frames_out[:-n_pad_frames]
-            print(f"after removal, {len(frames_out)=}")
-
-        # Blend overlapping temporal frames
-        if chunk_idx > 0:
-            for f_idx, frame in enumerate(output_frames[-temp_overlap:]):
-                # frame.save(f"{(chunk_idx-1)=}_{start + f_idx}.png")
-                # frames_out[f_idx].save(f"{chunk_idx=}_{start + f_idx}.png")
-                blend_factor = f_idx / (temp_overlap - 1)
-                output_frames[-temp_overlap + f_idx] = Image.blend(
-                    frame, frames_out[f_idx], alpha=blend_factor
-                )
-
-            output_frames.extend(frames_out[temp_overlap:])
-        else:
-            output_frames.extend(frames_out)
-
-        del video, LQ, frames_out
-        torch.cuda.empty_cache()
-
-    return output_frames
+    return frames_out
 
 
 def main():
